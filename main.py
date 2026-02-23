@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from jose import jwt, JWTError
 from passlib.hash import bcrypt
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, constr
 import os
 import time
 import psycopg2
@@ -35,35 +35,46 @@ def make_token(email: str):
         algorithm="HS256",
     )
 
+# bcrypt supports max 72 bytes (not characters). We'll enforce a safe max length.
 class AuthIn(BaseModel):
-    email: str
-    password: str
+    email: EmailStr
+    password: constr(min_length=8, max_length=72)
+
+def _ensure_bcrypt_len(password: str):
+    # Byte-accurate check (covers emojis / multi-byte characters)
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer")
 
 @app.post("/auth/register")
 def register(data: AuthIn):
+    _ensure_bcrypt_len(data.password)
+
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM users WHERE email=%s", (data.email,))
+        cur.execute("SELECT id FROM users WHERE email=%s", (str(data.email),))
         if cur.fetchone():
-            raise HTTPException(400, "Email already exists")
+            raise HTTPException(status_code=400, detail="Email already exists")
+
         cur.execute(
             "INSERT INTO users (email, password_hash) VALUES (%s,%s)",
-            (data.email, bcrypt.hash(data.password)),
+            (str(data.email), bcrypt.hash(data.password)),
         )
         conn.commit()
+
     return {"ok": True}
 
 @app.post("/auth/login")
 def login(data: AuthIn):
+    _ensure_bcrypt_len(data.password)
+
     with db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT password_hash FROM users WHERE email=%s", (data.email,)
-        )
+        cur.execute("SELECT password_hash FROM users WHERE email=%s", (str(data.email),))
         row = cur.fetchone()
         if not row or not bcrypt.verify(data.password, row[0]):
-            raise HTTPException(401, "Invalid credentials")
-    return {"access_token": make_token(data.email)}
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    return {"access_token": make_token(str(data.email))}
 
 @app.get("/me")
 def me(token: str):
@@ -71,13 +82,11 @@ def me(token: str):
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         email = payload["sub"]
     except JWTError:
-        raise HTTPException(401)
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     with db() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT license_active FROM users WHERE email=%s", (email,)
-        )
+        cur.execute("SELECT license_active FROM users WHERE email=%s", (email,))
         row = cur.fetchone()
 
     return {"email": email, "license_active": row[0] if row else False}
