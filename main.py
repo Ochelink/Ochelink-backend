@@ -57,6 +57,13 @@ class AuthIn(BaseModel):
     password: constr(min_length=8, max_length=72)
 
 # ==========================
+# DEBUG / PROOF ENDPOINT
+# ==========================
+@app.get("/version")
+def version():
+    return {"version": "main.py drop-in v3 (register creates public.licenses + returns license_id)"}
+
+# ==========================
 # ROUTES
 # ==========================
 @app.post("/auth/register")
@@ -66,29 +73,38 @@ def register(data: AuthIn):
     with db() as conn:
         cur = conn.cursor()
 
-        # Check if user exists
-        cur.execute("SELECT id FROM users WHERE email=%s", (str(data.email),))
+        # 1) Check if user exists (schema-qualified)
+        cur.execute("SELECT id FROM public.users WHERE email=%s", (str(data.email),))
         if cur.fetchone():
             raise HTTPException(status_code=400, detail="Email already exists")
 
-        # Create user
+        # 2) Insert user (schema-qualified)
         cur.execute(
-            "INSERT INTO users (email, password_hash) VALUES (%s, %s)",
+            "INSERT INTO public.users (email, password_hash) VALUES (%s,%s) RETURNING id",
             (str(data.email), bcrypt.hash(data.password)),
         )
+        user_id = cur.fetchone()[0]
 
-        # Create license record (inactive until Stripe payment)
-        # Safe to re-run due to ON CONFLICT.
+        # 3) Insert license (schema-qualified) and RETURN the license row
+        # Using DO UPDATE purely so we can always RETURN a row.
         cur.execute(
-            "INSERT INTO licenses (email, active, device_limit) "
+            "INSERT INTO public.licenses (email, active, device_limit) "
             "VALUES (%s, %s, %s) "
-            "ON CONFLICT (email) DO NOTHING",
+            "ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email "
+            "RETURNING id, active, device_limit",
             (str(data.email), False, 2),
         )
+        lic = cur.fetchone()  # (license_id, active, device_limit)
 
         conn.commit()
 
-    return {"ok": True}
+    return {
+        "ok": True,
+        "user_id": str(user_id),
+        "license_id": str(lic[0]) if lic else None,
+        "license_active": bool(lic[1]) if lic else False,
+        "device_limit": int(lic[2]) if lic else 2,
+    }
 
 @app.post("/auth/login")
 def login(data: AuthIn):
@@ -96,9 +112,8 @@ def login(data: AuthIn):
 
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE email=%s", (str(data.email),))
+        cur.execute("SELECT password_hash FROM public.users WHERE email=%s", (str(data.email),))
         row = cur.fetchone()
-
         if not row or not bcrypt.verify(data.password, row[0]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -118,13 +133,10 @@ def me(token: str):
 
     with db() as conn:
         cur = conn.cursor()
-
-        # Source of truth is licenses.active
-        cur.execute("SELECT active, device_limit FROM licenses WHERE email=%s", (email,))
+        cur.execute("SELECT active, device_limit FROM public.licenses WHERE email=%s", (email,))
         lic = cur.fetchone()
 
-        if not lic:
-            return {"email": email, "license_active": False, "device_limit": 2}
+    if not lic:
+        return {"email": email, "license_active": False, "device_limit": 2}
 
-        active, device_limit = lic
-        return {"email": email, "license_active": bool(active), "device_limit": int(device_limit)}
+    return {"email": email, "license_active": bool(lic[0]), "device_limit": int(lic[1])}
