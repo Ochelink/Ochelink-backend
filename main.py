@@ -10,6 +10,10 @@ import stripe
 import logging
 
 from email_verification import router as email_verification_router, send_verification_email
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+
+from email_service import send_email
+from email_templates import password_reset_email, license_activated_email
 
 logging.basicConfig(level=logging.INFO)
 
@@ -18,6 +22,10 @@ logging.basicConfig(level=logging.INFO)
 # ==========================
 DATABASE_URL = os.environ["DATABASE_URL"]
 JWT_SECRET = os.environ["JWT_SECRET"]
+
+EMAIL_SECRET = os.environ.get("EMAIL_SECRET", "")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ochelink.com").rstrip("/")
+DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", f"{FRONTEND_URL}/download")
 
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
@@ -64,6 +72,26 @@ def make_token(email: str):
         algorithm="HS256",
     )
 
+
+def _email_serializer() -> URLSafeTimedSerializer:
+    if not EMAIL_SECRET:
+        raise RuntimeError("EMAIL_SECRET is missing. Set it in Render env vars.")
+    return URLSafeTimedSerializer(EMAIL_SECRET)
+
+
+def _make_reset_token(email: str) -> str:
+    return _email_serializer().dumps(_email_norm(email), salt="pwd-reset")
+
+
+def _read_reset_token(token: str) -> str:
+    try:
+        email = _email_serializer().loads(token, salt="pwd-reset", max_age=60 * 60)  # 60 min
+        return _email_norm(email)
+    except SignatureExpired:
+        raise HTTPException(status_code=400, detail="Reset link expired")
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+
 def _ensure_bcrypt_len(password: str):
     if len(password.encode("utf-8")) > 72:
         raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer")
@@ -96,6 +124,15 @@ def _email_from_bearer(request: Request) -> str:
 
 class AuthIn(BaseModel):
     email: EmailStr
+    password: constr(min_length=8, max_length=72)
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetIn(BaseModel):
+    token: str
     password: constr(min_length=8, max_length=72)
 
 @app.get("/version")
@@ -177,6 +214,54 @@ def login(data: AuthIn):
     if not bcrypt.verify(data.password, password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     return {"access_token": make_token(email), "is_verified": bool(is_verified)}
+
+
+@app.post("/auth/request-password-reset")
+def request_password_reset(data: PasswordResetRequestIn):
+    """
+    Sends a password reset email (best-effort). Always returns ok to prevent enumeration.
+    """
+    email = _email_norm(data.email)
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM public.users WHERE email=%s", (email,))
+        exists = cur.fetchone() is not None
+
+    if not exists:
+        return {"ok": True}
+
+    token = _make_reset_token(email)
+    reset_url = f"{FRONTEND_URL}/reset-password?token={token}"
+    subject, html_doc = password_reset_email(reset_url)
+
+    try:
+        send_email(email, subject, html_doc, fallback_log=f"RESET LINK for {email}: {reset_url}")
+    except Exception:
+        # send_email is already best-effort, but keep this extra safe
+        pass
+
+    return {"ok": True}
+
+
+@app.post("/auth/reset-password")
+def reset_password(data: PasswordResetIn):
+    _ensure_bcrypt_len(data.password)
+    email = _read_reset_token(data.token)
+
+    with db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM public.users WHERE email=%s", (email,))
+        if cur.fetchone() is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        cur.execute(
+            "UPDATE public.users SET password_hash=%s WHERE email=%s",
+            (bcrypt.hash(data.password), email),
+        )
+        conn.commit()
+
+    return {"ok": True}
 
 
 
@@ -317,6 +402,13 @@ async def stripe_webhook(request: Request):
                 (email, customer_id, checkout_session_id, payment_intent_id),
             )
             conn.commit()
+
+        # License activated email (best-effort; never fail webhook)
+        try:
+            subject, html_doc = license_activated_email(DOWNLOAD_URL)
+            send_email(email, subject, html_doc, fallback_log=f"LICENSE ACTIVATED for {email}")
+        except Exception:
+            pass
 
         return {"ok": True, "email": email, "activated": True}
 
