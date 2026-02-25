@@ -3,7 +3,7 @@ uvicorn[standard]
 psycopg2-binary
 python-jose
 passlib==1.7.4
-bcrypt==4.1.3
+bcrypt==3.2.2
 stripe
 email-validator==2.1.1
 itsdangerous
