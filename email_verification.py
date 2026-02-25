@@ -8,7 +8,24 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
-logger = logging.getLogger("ochelink.email_verification")
+logger = logging.getLogger("uvicorn.error")
+def _log(msg: str, *args):
+    try:
+        logger.info(msg, *args)
+    except Exception:
+        pass
+    try:
+        print("[email_verification]", msg % args if args else msg, flush=True)
+    except Exception:
+        print("[email_verification]", msg, flush=True)
+
+# Log env presence (masked) at import time for quick diagnosis
+try:
+    _log("Loaded. FRONTEND_URL=%s EMAIL_FROM=%s RESEND_API_KEY_set=%s EMAIL_SECRET_set=%s",
+         os.environ.get("FRONTEND_URL"), os.environ.get("EMAIL_FROM"),
+         bool(os.environ.get("RESEND_API_KEY")), bool(os.environ.get("EMAIL_SECRET")))
+except Exception:
+    pass
 
 # -------------------------
 # ENV
@@ -80,7 +97,7 @@ def _send_email_resend(to_email: str, subject: str, html: str) -> None:
         timeout=15,
     )
 
-    logger.info('Resend response %s for %s', resp.status_code, to_email)
+    _log('Resend response %s for %s', resp.status_code, to_email)
 
     if resp.status_code >= 400:
         raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
@@ -88,7 +105,7 @@ def _send_email_resend(to_email: str, subject: str, html: str) -> None:
 
 
 def send_verification_email(email: str) -> str:
-    logger.info('Sending verification email to %s', _email_norm(email))
+    _log('Sending verification email to %s', _email_norm(email))
     """
     Sends (or logs) the verification email.
     Returns the verify link (useful for testing).
@@ -107,15 +124,16 @@ def send_verification_email(email: str) -> str:
     </div>
     """.strip()
 
-    if RESEND_API_KEY:
+    if RESEND_API_KEY and RESEND_API_KEY.strip():
         try:
             _send_email_resend(_email_norm(email), subject, html)
         except Exception:
-            logger.exception("Resend send failed; logging verify link instead.")
-            logger.info("VERIFY LINK for %s: %s", _email_norm(email), link)
+            _log('Resend send failed; logging verify link instead.')
+            logger.exception('Resend send failed')
+            _log('VERIFY LINK for %s: %s', _email_norm(email), link)
     else:
         # Safe fallback — doesn't break your backend while email is not configured.
-        logger.info("RESEND_API_KEY not set. VERIFY LINK for %s: %s", _email_norm(email), link)
+        _log('RESEND_API_KEY not set. VERIFY LINK for %s: %s', _email_norm(email), link)
 
     return link
 
@@ -144,12 +162,12 @@ def send_verification(body: SendVerificationBody):
             return {"ok": True}
 
     if not row:
-        logger.info('send-verification: no user for %s (returning ok)', email)
+        _log('send-verification: no user for %s (returning ok)', email)
         return {"ok": True}
 
     is_verified = bool(row[0]) if row[0] is not None else False
     if is_verified:
-        logger.info('send-verification: already verified for %s (returning ok)', email)
+        _log('send-verification: already verified for %s (returning ok)', email)
         return {"ok": True}
 
     send_verification_email(email)
