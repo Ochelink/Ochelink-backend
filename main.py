@@ -7,8 +7,11 @@ import os
 import time
 import psycopg2
 import stripe
+import logging
 
 from email_verification import router as email_verification_router, send_verification_email
+
+logging.basicConfig(level=logging.INFO)
 
 # ==========================
 # ENV
@@ -137,8 +140,9 @@ def register(data: AuthIn):
     # NOTE: requires DB column public.users.is_verified (default FALSE)
     try:
         send_verification_email(email)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.getLogger("uvicorn.error").exception("Verification email send failed: %s", e)
+        print("[register] verification email send failed:", e, flush=True)
 
     return {
         "ok": True,
