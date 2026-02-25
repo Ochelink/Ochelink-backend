@@ -1,6 +1,6 @@
 OcheLink Backend (Render + FastAPI)
 
-This zip contains your working backend plus Email Verification (v10 - Resend).
+This zip contains your working backend plus Email Verification + Password Reset + License Activated email (Resend).
 
 Changes in v10 (Resend email sender)
 - Added email_verification.py
@@ -23,9 +23,16 @@ Render environment variables to add
 - EMAIL_FROM     = Ochelink@outlook.com   (display/from address)
 - RESEND_API_KEY  = (required to actually send emails)
 
+Optional
+- DOWNLOAD_URL = https://ochelink.com/download   (used in the license activated email; defaults to FRONTEND_URL/download)
+
 Notes
 - If RESEND_API_KEY is not set, the backend will log the verification link instead of sending email.
 - This is intentional so you can deploy safely before configuring email delivery.
+
+Password reset
+- POST /auth/request-password-reset  {"email": "user@example.com"}
+- POST /auth/reset-password          {"token": "...", "password": "new_password"}
 
 
 ## Verification-gated purchase flow (added)
