@@ -80,12 +80,15 @@ def _send_email_resend(to_email: str, subject: str, html: str) -> None:
         timeout=15,
     )
 
+    logger.info('Resend response %s for %s', resp.status_code, to_email)
+
     if resp.status_code >= 400:
         raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
 
 
 
 def send_verification_email(email: str) -> str:
+    logger.info('Sending verification email to %s', _email_norm(email))
     """
     Sends (or logs) the verification email.
     Returns the verify link (useful for testing).
@@ -141,10 +144,12 @@ def send_verification(body: SendVerificationBody):
             return {"ok": True}
 
     if not row:
+        logger.info('send-verification: no user for %s (returning ok)', email)
         return {"ok": True}
 
     is_verified = bool(row[0]) if row[0] is not None else False
     if is_verified:
+        logger.info('send-verification: already verified for %s (returning ok)', email)
         return {"ok": True}
 
     send_verification_email(email)
