@@ -8,6 +8,8 @@ import time
 import psycopg2
 import stripe
 
+from email_verification import router as email_verification_router, send_verification_email
+
 # ==========================
 # ENV
 # ==========================
@@ -31,6 +33,9 @@ stripe.api_key = STRIPE_SECRET_KEY
 # APP
 # ==========================
 app = FastAPI()
+
+# Email verification routes
+app.include_router(email_verification_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -92,7 +97,7 @@ class AuthIn(BaseModel):
 
 @app.get("/version")
 def version():
-    return {"version": "main.py v7 (v6 + device licensing /license/check)"}
+    return {"version": "main.py v9 (email verification gate + verify-pending flow)"}
 
 # ==========================
 # AUTH ROUTES
@@ -128,6 +133,13 @@ def register(data: AuthIn):
         lic = cur.fetchone()
         conn.commit()
 
+    # Email verification (non-blocking; never break register if email fails)
+    # NOTE: requires DB column public.users.is_verified (default FALSE)
+    try:
+        send_verification_email(email)
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "user_id": str(user_id),
@@ -143,31 +155,68 @@ def login(data: AuthIn):
 
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM public.users WHERE email=%s", (email,))
-        row = cur.fetchone()
+        try:
+            cur.execute("SELECT password_hash, is_verified FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    if not row or not bcrypt.verify(data.password, row[0]):
+            password_hash, is_verified = row[0], bool(row[1]) if row[1] is not None else False
+        except psycopg2.errors.UndefinedColumn:
+            # Backward-compatible: if DB not migrated yet, skip verification check
+            cur.execute("SELECT password_hash FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            password_hash, is_verified = row[0], True
+
+    if not bcrypt.verify(data.password, password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"access_token": make_token(email), "is_verified": bool(is_verified)}
 
-    return {"access_token": make_token(email)}
+
+
 
 @app.get("/me")
-def me(token: str):
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        email = _email_norm(payload["sub"])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+def me(request: Request, token: str | None = None):
+    # Supports either:
+    # - Authorization: Bearer <jwt>
+    # - ?token=<jwt> (backward compatible)
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            email = _email_norm(payload["sub"])
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    else:
+        email = _email_from_bearer(request)
 
+    is_verified = True
     with db() as conn:
         cur = conn.cursor()
+
+        # License info
         cur.execute("SELECT active, device_limit FROM public.licenses WHERE email=%s", (email,))
         lic = cur.fetchone()
 
-    if not lic:
-        return {"email": email, "license_active": False, "device_limit": 2}
+        # Verification status (backward compatible if column not migrated yet)
+        try:
+            cur.execute("SELECT is_verified FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if row is not None:
+                is_verified = bool(row[0]) if row[0] is not None else False
+        except psycopg2.errors.UndefinedColumn:
+            is_verified = True
 
-    return {"email": email, "license_active": bool(lic[0]), "device_limit": int(lic[1])}
+    if not lic:
+        return {"email": email, "license_active": False, "device_limit": 2, "is_verified": bool(is_verified)}
+
+    return {
+        "email": email,
+        "license_active": bool(lic[0]),
+        "device_limit": int(lic[1]),
+        "is_verified": bool(is_verified),
+    }
 
 # ==========================
 # BILLING: CREATE CHECKOUT SESSION
@@ -181,6 +230,20 @@ def create_checkout_session(data: CheckoutIn):
         raise HTTPException(status_code=500, detail="STRIPE_PRICE_ID not set")
 
     email = _email_norm(data.email)
+
+    # Block checkout until email is verified (prevents typo-email purchases)
+    with db() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT is_verified FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            is_verified = bool(row[0]) if row and row[0] is not None else False
+        except psycopg2.errors.UndefinedColumn:
+            # If DB not migrated yet, allow (but you should migrate)
+            is_verified = True
+
+    if not is_verified:
+        raise HTTPException(status_code=403, detail="Email not verified")
 
     # Create a real Stripe Checkout Session
     session = stripe.checkout.Session.create(
