@@ -8,7 +8,11 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 
+from email_service import send_email
+from email_templates import verification_email
+
 logger = logging.getLogger("uvicorn.error")
+
 def _log(msg: str, *args):
     try:
         logger.info(msg, *args)
@@ -17,13 +21,20 @@ def _log(msg: str, *args):
     try:
         print("[email_verification]", msg % args if args else msg, flush=True)
     except Exception:
-        print("[email_verification]", msg, flush=True)
+        try:
+            print("[email_verification]", msg, flush=True)
+        except Exception:
+            pass
 
 # Log env presence (masked) at import time for quick diagnosis
 try:
-    _log("Loaded. FRONTEND_URL=%s EMAIL_FROM=%s RESEND_API_KEY_set=%s EMAIL_SECRET_set=%s",
-         os.environ.get("FRONTEND_URL"), os.environ.get("EMAIL_FROM"),
-         bool(os.environ.get("RESEND_API_KEY")), bool(os.environ.get("EMAIL_SECRET")))
+    _log(
+        "Loaded. FRONTEND_URL=%s EMAIL_FROM=%s RESEND_API_KEY_set=%s EMAIL_SECRET_set=%s",
+        os.environ.get("FRONTEND_URL"),
+        os.environ.get("EMAIL_FROM"),
+        bool(os.environ.get("RESEND_API_KEY")),
+        bool(os.environ.get("EMAIL_SECRET")),
+    )
 except Exception:
     pass
 
@@ -34,8 +45,6 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 
 EMAIL_SECRET = os.environ.get("EMAIL_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://ochelink.com").rstrip("/")
-EMAIL_FROM = os.environ.get("EMAIL_FROM", "Ochelink@outlook.com")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 
 VERIFY_SALT = "email-verify"
 VERIFY_TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24  # 24 hours
@@ -74,66 +83,23 @@ def read_verification_token(token: str) -> str:
 
 
 def build_verify_link(token: str) -> str:
-    # Recommended UX: website page handles this and calls backend.
+    # Website page handles token and calls backend.
     return f"{FRONTEND_URL}/verify-email?token={token}"
 
 
-def _send_email_resend(to_email: str, subject: str, html: str) -> None:
-    """Send an email via Resend API."""
-    import requests
-
-    resp = requests.post(
-        "https://api.resend.com/emails",
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "from": EMAIL_FROM,
-            "to": [to_email],
-            "subject": subject,
-            "html": html,
-        },
-        timeout=15,
-    )
-
-    _log('Resend response %s for %s', resp.status_code, to_email)
-
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
-
-
-
 def send_verification_email(email: str) -> str:
-    _log('Sending verification email to %s', _email_norm(email))
-    """
-    Sends (or logs) the verification email.
-    Returns the verify link (useful for testing).
-    """
     token = make_verification_token(email)
     link = build_verify_link(token)
 
-    subject = "Verify your OcheLink email"
-    html = f"""
-    <div style="font-family: Arial, sans-serif; line-height: 1.5;">
-      <h2>Verify your email</h2>
-      <p>Please verify your email address to finish setting up your OcheLink account.</p>
-      <p><a href="{link}">Verify email</a></p>
-      <p>This link expires in 24 hours.</p>
-      <p>If you didn’t create an account, you can ignore this email.</p>
-    </div>
-    """.strip()
+    subject, html_doc = verification_email(link)
 
-    if RESEND_API_KEY and RESEND_API_KEY.strip():
-        try:
-            _send_email_resend(_email_norm(email), subject, html)
-        except Exception:
-            _log('Resend send failed; logging verify link instead.')
-            logger.exception('Resend send failed')
-            _log('VERIFY LINK for %s: %s', _email_norm(email), link)
-    else:
-        # Safe fallback — doesn't break your backend while email is not configured.
-        _log('RESEND_API_KEY not set. VERIFY LINK for %s: %s', _email_norm(email), link)
+    _log("Sending verification email to %s", _email_norm(email))
+    send_email(
+        _email_norm(email),
+        subject,
+        html_doc,
+        fallback_log=f"VERIFY LINK for {_email_norm(email)}: {link}",
+    )
 
     return link
 
@@ -147,9 +113,7 @@ class SendVerificationBody(BaseModel):
 
 @router.post("/send-verification")
 def send_verification(body: SendVerificationBody):
-    """
-    Resend verification email. Always returns ok to prevent user enumeration.
-    """
+    """Resend verification email. Always returns ok to prevent user enumeration."""
     email = _email_norm(body.email)
 
     with db() as conn:
@@ -162,12 +126,12 @@ def send_verification(body: SendVerificationBody):
             return {"ok": True}
 
     if not row:
-        _log('send-verification: no user for %s (returning ok)', email)
+        _log("send-verification: no user for %s (returning ok)", email)
         return {"ok": True}
 
     is_verified = bool(row[0]) if row[0] is not None else False
     if is_verified:
-        _log('send-verification: already verified for %s (returning ok)', email)
+        _log("send-verification: already verified for %s (returning ok)", email)
         return {"ok": True}
 
     send_verification_email(email)
