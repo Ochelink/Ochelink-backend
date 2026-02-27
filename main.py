@@ -32,10 +32,10 @@ STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 
 CHECKOUT_SUCCESS_URL = os.environ.get(
-    "CHECKOUT_SUCCESS_URL", "https://ochelink-backend.onrender.com/docs"
+    "CHECKOUT_SUCCESS_URL", f"{FRONTEND_URL}/success"
 )
 CHECKOUT_CANCEL_URL = os.environ.get(
-    "CHECKOUT_CANCEL_URL", "https://ochelink-backend.onrender.com/docs"
+    "CHECKOUT_CANCEL_URL", f"{FRONTEND_URL}/cancel"
 )
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -50,8 +50,17 @@ app.include_router(email_verification_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=True,
+    # IMPORTANT:
+    # - Do NOT use allow_origins=["*"] with allow_credentials=True (browsers block this).
+    # - This API uses Bearer tokens, not cookies, so credentials are not required.
+    # - Restrict origins to your Cloudflare Pages/custom domain(s).
+    allow_origins=[
+        "https://ochelink.com",
+        "https://www.ochelink.com",
+        # Add preview domain if needed, e.g.:
+        # "https://your-project.pages.dev",
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
