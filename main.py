@@ -56,188 +56,276 @@ allowed_origins = []
 if frontend_url:
     allowed_origins.append(frontend_url)
     # If you set FRONTEND_URL to https://ochelink.com, also allow www.
-    if frontend_url.startswith("https://") and "www." not in frontend_url:
-        allowed_origins.append(frontend_url.replace("https://", "https://www.", 1))
-    if frontend_url.startswith("http://") and "www." not in frontend_url:
-        allowed_origins.append(frontend_url.replace("http://", "http://www.", 1))
+    if frontend_url.startswith("https://") and frontend_url.count(".") >= 1:
+        host = frontend_url.split("https://", 1)[1]
+        if host.startswith("www."):
+            allowed_origins.append("https://" + host[len("www."):])
+        else:
+            allowed_origins.append("https://www." + host)
+
+# Fallback (safe defaults for production)
+for o in ["https://ochelink.com", "https://www.ochelink.com"]:
+    if o not in allowed_origins:
+        allowed_origins.append(o)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins or ["*"],
-    allow_credentials=bool(allowed_origins),
+    allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ==========================
-# DB HELPERS
+# DB
 # ==========================
 def db():
     return psycopg2.connect(DATABASE_URL)
 
+# ==========================
+# AUTH HELPERS
+# ==========================
+def make_token(email: str):
+    return jwt.encode(
+        {"sub": email, "exp": int(time.time()) + 3600},
+        JWT_SECRET,
+        algorithm="HS256",
+    )
+
+
+def _email_serializer() -> URLSafeTimedSerializer:
+    if not EMAIL_SECRET:
+        raise RuntimeError("EMAIL_SECRET is missing. Set it in Render env vars.")
+    return URLSafeTimedSerializer(EMAIL_SECRET)
+
+
+def _make_reset_token(email: str) -> str:
+    return _email_serializer().dumps(_email_norm(email), salt="pwd-reset")
+
+
+def _read_reset_token(token: str) -> str:
+    try:
+        email = _email_serializer().loads(token, salt="pwd-reset", max_age=60 * 60)  # 60 min
+        return _email_norm(email)
+    except SignatureExpired:
+        raise HTTPException(status_code=400, detail="Reset link expired")
+    except BadSignature:
+        raise HTTPException(status_code=400, detail="Invalid reset token")
+
+def _ensure_bcrypt_len(password: str):
+    if len(password.encode("utf-8")) > 72:
+        raise HTTPException(status_code=400, detail="Password must be 72 bytes or fewer")
+
 def _email_norm(email: str) -> str:
-    return (email or "").strip().lower()
+    return str(email).strip().lower()
 
-# ==========================
-# MODELS
-# ==========================
-class RegisterIn(BaseModel):
-    email: EmailStr
-    password: constr(min_length=8)
+def _email_from_bearer(request: Request) -> str:
+    """
+    Reads Authorization: Bearer <token>
+    Returns the email from JWT "sub".
+    """
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth:
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
 
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
+    parts = auth.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authorization must be Bearer <token>")
 
-class ResetRequestIn(BaseModel):
-    email: EmailStr
-
-class ResetConfirmIn(BaseModel):
-    token: str
-    new_password: constr(min_length=8)
-
-# ==========================
-# TOKEN SERIALIZER (password reset)
-# ==========================
-serializer = URLSafeTimedSerializer(EMAIL_SECRET or JWT_SECRET)
-
-# ==========================
-# AUTH UTILS
-# ==========================
-def make_jwt(email: str) -> str:
-    payload = {"email": email, "iat": int(time.time())}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-def decode_jwt(token: str) -> str:
+    token = parts[1]
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload.get("email", "")
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return _email_norm(email)
     except JWTError:
-        return ""
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+class AuthIn(BaseModel):
+    email: EmailStr
+    password: constr(min_length=8, max_length=72)
+
+
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetIn(BaseModel):
+    token: str
+    password: constr(min_length=8, max_length=72)
+
+@app.get("/version")
+def version():
+    return {"version": "main.py v9 (email verification gate + verify-pending flow)"}
 
 # ==========================
-# ROUTES
+# AUTH ROUTES
 # ==========================
-@app.get("/")
-def root():
-    return {"ok": True, "service": "ochelink-backend"}
-
 @app.post("/auth/register")
-def register(data: RegisterIn):
+def register(data: AuthIn):
+    _ensure_bcrypt_len(data.password)
     email = _email_norm(data.email)
-    password_hash = bcrypt.hash(data.password)
+
+    with db() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT id FROM public.users WHERE email=%s", (email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=400, detail="Email already exists")
+
+        cur.execute(
+            "INSERT INTO public.users (email, password_hash) VALUES (%s,%s) RETURNING id",
+            (email, bcrypt.hash(data.password)),
+        )
+        user_id = cur.fetchone()[0]
+
+        # Ensure a licenses row exists for the email
+        cur.execute(
+            """
+            INSERT INTO public.licenses (email, active, device_limit)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (email) DO NOTHING
+            RETURNING id, active, device_limit
+            """,
+            (email, False, 2),
+        )
+        lic = cur.fetchone()
+        conn.commit()
+
+    # Email verification (non-blocking; never break register if email fails)
+    # NOTE: requires DB column public.users.is_verified (default FALSE)
+    try:
+        send_verification_email(email)
+    except Exception as e:
+        logging.getLogger("uvicorn.error").exception("Verification email send failed: %s", e)
+        print("[register] verification email send failed:", e, flush=True)
+
+    return {
+        "ok": True,
+        "user_id": str(user_id),
+        "license_id": str(lic[0]) if lic else None,
+        "license_active": bool(lic[1]) if lic else False,
+        "device_limit": int(lic[2]) if lic else 2,
+    }
+
+@app.post("/auth/login")
+def login(data: AuthIn):
+    _ensure_bcrypt_len(data.password)
+    email = _email_norm(data.email)
+
+    with db() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT password_hash, is_verified FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+
+            password_hash, is_verified = row[0], bool(row[1]) if row[1] is not None else False
+        except psycopg2.errors.UndefinedColumn:
+            # Backward-compatible: if DB not migrated yet, skip verification check
+            cur.execute("SELECT password_hash FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+            password_hash, is_verified = row[0], True
+
+    if not bcrypt.verify(data.password, password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"access_token": make_token(email), "is_verified": bool(is_verified)}
+
+
+@app.post("/auth/request-password-reset")
+def request_password_reset(data: PasswordResetRequestIn):
+    """
+    Sends a password reset email (best-effort). Always returns ok to prevent enumeration.
+    """
+    email = _email_norm(data.email)
 
     with db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM public.users WHERE email=%s", (email,))
-        if cur.fetchone():
-            raise HTTPException(status_code=400, detail="Account already exists")
+        exists = cur.fetchone() is not None
 
-        cur.execute(
-            """
-            INSERT INTO public.users (email, password_hash, license, is_verified)
-            VALUES (%s, %s, false, false)
-            """,
-            (email, password_hash),
-        )
-        conn.commit()
+    if not exists:
+        return {"ok": True}
 
-    # Send verification email (best-effort)
-    try:
-        send_verification_email(email)
-    except Exception as e:
-        logging.warning(f"Failed to send verification email: {e}")
-
-    return {"ok": True, "email": email}
-
-@app.post("/auth/login")
-def login(data: LoginIn):
-    email = _email_norm(data.email)
-
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT password_hash, license, is_verified FROM public.users WHERE email=%s",
-            (email,),
-        )
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-        password_hash, has_license, is_verified = row[0], bool(row[1]), bool(row[2])
-
-        if not bcrypt.verify(data.password, password_hash):
-            raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    token = make_jwt(email)
-    return {
-        "ok": True,
-        "token": token,
-        "email": email,
-        "license": bool(has_license),
-        "is_verified": bool(is_verified),
-    }
-
-# ==========================
-# PASSWORD RESET
-# ==========================
-@app.post("/auth/request-password-reset")
-def request_password_reset(data: ResetRequestIn):
-    email = _email_norm(data.email)
-
-    # Generate token even if account doesn't exist (avoid user enumeration)
-    token = serializer.dumps(email, salt="pwreset")
-    reset_link = f"{FRONTEND_URL}/reset-password?token={token}"
+    token = _make_reset_token(email)
+    reset_url = f"{FRONTEND_URL}/reset-password?token={token}"
+    subject, html_doc = password_reset_email(reset_url)
 
     try:
-        html = password_reset_email(reset_link)
-        send_email(to_email=email, subject="Reset your OcheLink password", html=html)
-    except Exception as e:
-        logging.warning(f"Failed to send password reset email: {e}")
+        send_email(email, subject, html_doc, fallback_log=f"RESET LINK for {email}: {reset_url}")
+    except Exception:
+        # send_email is already best-effort, but keep this extra safe
+        pass
 
     return {"ok": True}
 
-@app.post("/auth/confirm-password-reset")
-def confirm_password_reset(data: ResetConfirmIn):
-    try:
-        email = serializer.loads(data.token, salt="pwreset", max_age=60 * 60)  # 1 hour
-    except SignatureExpired:
-        raise HTTPException(status_code=400, detail="Reset token expired")
-    except BadSignature:
-        raise HTTPException(status_code=400, detail="Invalid reset token")
 
-    email = _email_norm(email)
-    new_hash = bcrypt.hash(data.new_password)
+@app.post("/auth/reset-password")
+def reset_password(data: PasswordResetIn):
+    _ensure_bcrypt_len(data.password)
+    email = _read_reset_token(data.token)
 
     with db() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE public.users SET password_hash=%s WHERE email=%s", (new_hash, email))
-        conn.commit()
-
-    return {"ok": True}
-
-# ==========================
-# LICENSE STATUS
-# ==========================
-@app.get("/license/status")
-def license_status(request: Request):
-    auth = request.headers.get("authorization") or ""
-    token = auth.replace("Bearer", "").strip()
-    email = decode_jwt(token)
-    if not email:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    with db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT license, is_verified FROM public.users WHERE email=%s", (email,))
-        row = cur.fetchone()
-        if not row:
+        cur.execute("SELECT 1 FROM public.users WHERE email=%s", (email,))
+        if cur.fetchone() is None:
             raise HTTPException(status_code=404, detail="User not found")
 
+        cur.execute(
+            "UPDATE public.users SET password_hash=%s WHERE email=%s",
+            (bcrypt.hash(data.password), email),
+        )
+        conn.commit()
+
+    return {"ok": True}
+
+
+
+
+@app.get("/me")
+def me(request: Request, token: str | None = None):
+    # Supports either:
+    # - Authorization: Bearer <jwt>
+    # - ?token=<jwt> (backward compatible)
+    if token:
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            email = _email_norm(payload["sub"])
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    else:
+        email = _email_from_bearer(request)
+
+    is_verified = True
+    with db() as conn:
+        cur = conn.cursor()
+
+        # License info
+        cur.execute("SELECT active, device_limit FROM public.licenses WHERE email=%s", (email,))
+        lic = cur.fetchone()
+
+        # Verification status (backward compatible if column not migrated yet)
+        try:
+            cur.execute("SELECT is_verified FROM public.users WHERE email=%s", (email,))
+            row = cur.fetchone()
+            if row is not None:
+                is_verified = bool(row[0]) if row[0] is not None else False
+        except psycopg2.errors.UndefinedColumn:
+            is_verified = True
+
+    if not lic:
+        return {"email": email, "license_active": False, "device_limit": 2, "is_verified": bool(is_verified)}
+
     return {
         "email": email,
-        "license": bool(row[0]),
-        "is_verified": bool(row[1]),
+        "license_active": bool(lic[0]),
+        "device_limit": int(lic[1]),
+        "is_verified": bool(is_verified),
     }
 
 # ==========================
@@ -296,26 +384,176 @@ async def stripe_webhook(request: Request):
             secret=STRIPE_WEBHOOK_SECRET,
         )
     except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid payload")
+        raise HTTPException(status_code=400, detail="Invalid Stripe signature")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook error: {str(e)}")
 
-    # Handle successful Checkout
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        email = _email_norm(session.get("customer_email") or "")
 
+        # Only activate if actually paid
+        if session.get("payment_status") != "paid":
+            return {"ok": True}
+
+        customer_id = session.get("customer")
+        checkout_session_id = session.get("id")
+        payment_intent_id = session.get("payment_intent")
+
+        customer_details = session.get("customer_details") or {}
+        email = customer_details.get("email") or session.get("customer_email")
         if email:
-            with db() as conn:
-                cur = conn.cursor()
-                cur.execute("UPDATE public.users SET license=true WHERE email=%s", (email,))
-                conn.commit()
+            email = _email_norm(email)
 
-            # Send license activated email (best-effort)
-            try:
-                html = license_activated_email(DOWNLOAD_URL)
-                send_email(to_email=email, subject="Your OcheLink license is active", html=html)
-            except Exception as e:
-                logging.warning(f"Failed to send license activated email: {e}")
+        if not email:
+            return {"ok": True, "license_updated": False, "reason": "no_email"}
+
+        with db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO public.licenses (email, active, device_limit,
+                                            stripe_customer_id, stripe_checkout_session_id, stripe_payment_intent_id)
+                VALUES (%s, TRUE, 2, %s, %s, %s)
+                ON CONFLICT (email)
+                DO UPDATE SET active = TRUE,
+                              stripe_customer_id = EXCLUDED.stripe_customer_id,
+                              stripe_checkout_session_id = EXCLUDED.stripe_checkout_session_id,
+                              stripe_payment_intent_id = EXCLUDED.stripe_payment_intent_id,
+                              updated_at = now()
+                """,
+                (email, customer_id, checkout_session_id, payment_intent_id),
+            )
+            conn.commit()
+
+        # License activated email (best-effort; never fail webhook)
+        try:
+            subject, html_doc = license_activated_email(DOWNLOAD_URL)
+            send_email(email, subject, html_doc, fallback_log=f"LICENSE ACTIVATED for {email}")
+        except Exception:
+            pass
+
+        return {"ok": True, "email": email, "activated": True}
 
     return {"ok": True}
+
+# ==========================
+# STEP 3: DEVICE LICENSE CHECK
+# ==========================
+class LicenseCheckIn(BaseModel):
+    device_fingerprint: str
+
+@app.post("/license/check")
+def license_check(data: LicenseCheckIn, request: Request):
+    """
+    Desktop app sends:
+      - Authorization: Bearer <JWT from /auth/login>
+      - JSON: { "device_fingerprint": "..." }
+
+    Returns:
+      - allowed (bool)
+      - reason (string)
+      - devices_used (int)
+      - device_limit (int)
+    """
+    email = _email_from_bearer(request)
+    fp = (data.device_fingerprint or "").strip()
+
+    if not fp:
+        raise HTTPException(status_code=400, detail="device_fingerprint required")
+
+    with db() as conn:
+        cur = conn.cursor()
+
+        # Transaction (default) + FOR UPDATE prevents two concurrent logins
+        cur.execute(
+            """
+            SELECT id, active, device_limit
+            FROM public.licenses
+            WHERE email=%s
+            FOR UPDATE
+            """,
+            (email,),
+        )
+        lic = cur.fetchone()
+
+        if not lic:
+            conn.commit()
+            return {
+                "allowed": False,
+                "reason": "no_license_row",
+                "devices_used": 0,
+                "device_limit": 0,
+            }
+
+        license_id, active, device_limit = lic[0], bool(lic[1]), int(lic[2] or 0)
+
+        # Count active devices helper
+        def count_active_devices() -> int:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM public.devices
+                WHERE license_id=%s AND revoked=FALSE
+                """,
+                (license_id,),
+            )
+            return int(cur.fetchone()[0])
+
+        if not active:
+            used = count_active_devices()
+            conn.commit()
+            return {
+                "allowed": False,
+                "reason": "license_inactive",
+                "devices_used": used,
+                "device_limit": device_limit,
+            }
+
+        # If already registered (and not revoked), allow
+        cur.execute(
+            """
+            SELECT 1
+            FROM public.devices
+            WHERE license_id=%s AND device_fingerprint=%s AND revoked=FALSE
+            """,
+            (license_id, fp),
+        )
+        if cur.fetchone():
+            used = count_active_devices()
+            conn.commit()
+            return {
+                "allowed": True,
+                "reason": "device_already_registered",
+                "devices_used": used,
+                "device_limit": device_limit,
+            }
+
+        # Not registered -> check limit
+        used = count_active_devices()
+        if used >= device_limit:
+            conn.commit()
+            return {
+                "allowed": False,
+                "reason": "device_limit_exceeded",
+                "devices_used": used,
+                "device_limit": device_limit,
+            }
+
+        # Under limit -> register new device (Option 1: reinstall counts as a new device)
+        cur.execute(
+            """
+            INSERT INTO public.devices (license_id, device_fingerprint, revoked)
+            VALUES (%s, %s, FALSE)
+            """,
+            (license_id, fp),
+        )
+
+        used_after = count_active_devices()
+        conn.commit()
+
+        return {
+            "allowed": True,
+            "reason": "device_registered",
+            "devices_used": used_after,
+            "device_limit": device_limit,
+        }
