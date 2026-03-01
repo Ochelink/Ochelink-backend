@@ -481,6 +481,10 @@ def license_check(data: LicenseCheckIn, request: Request):
     if not fp:
         raise HTTPException(status_code=400, detail="device_fingerprint required")
 
+    # Website must NOT consume device slots. Only the desktop app should register devices.
+    client = (request.headers.get("x-ochelink-client") or request.headers.get("X-Ochelink-Client") or "").strip().lower()
+    is_app_client = client == "app"
+
     with db() as conn:
         cur = conn.cursor()
 
@@ -518,6 +522,28 @@ def license_check(data: LicenseCheckIn, request: Request):
                 (license_id,),
             )
             return int(cur.fetchone()[0])
+
+        # If this call is coming from the website (or any non-app client),
+        # DO NOT register the device or enforce device limits.
+        if not is_app_client:
+            if not active:
+                used = count_active_devices()
+                conn.commit()
+                return {
+                    "allowed": False,
+                    "reason": "license_inactive",
+                    "devices_used": used,
+                    "device_limit": device_limit,
+                }
+
+            used = count_active_devices()
+            conn.commit()
+            return {
+                "allowed": True,
+                "reason": "web_check_no_device",
+                "devices_used": used,
+                "device_limit": device_limit,
+            }
 
         if not active:
             used = count_active_devices()
