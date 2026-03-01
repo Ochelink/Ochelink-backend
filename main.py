@@ -8,6 +8,7 @@ import time
 import psycopg2
 import stripe
 import logging
+from contextlib import contextmanager
 
 from email_verification import router as email_verification_router, send_verification_email
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -80,8 +81,28 @@ app.add_middleware(
 # ==========================
 # DB
 # ==========================
+@contextmanager
 def db():
-    return psycopg2.connect(DATABASE_URL)
+    """Open a short-lived DB connection and ALWAYS close it.
+
+    IMPORTANT: psycopg2's connection context manager commits/rolls back but does NOT
+    close the connection. If you open a new connection per request and don't close it,
+    Supabase's pooler will hit its max clients and logins will fail.
+
+    This wrapper keeps your existing `with db() as conn:` usage but guarantees closing.
+    """
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        application_name="ochelink-backend",
+    )
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ==========================
 # AUTH HELPERS
@@ -362,7 +383,6 @@ def create_checkout_session(data: CheckoutIn):
         customer_email=email,
         success_url=CHECKOUT_SUCCESS_URL,
         cancel_url=CHECKOUT_CANCEL_URL,
-        allow_promotion_codes=True,  # ✅ Enables discount codes on Stripe Checkout
     )
 
     return {"url": session.url, "id": session.id}
