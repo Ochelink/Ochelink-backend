@@ -32,10 +32,10 @@ STRIPE_PRICE_ID = os.environ["STRIPE_PRICE_ID"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 
 CHECKOUT_SUCCESS_URL = os.environ.get(
-    "CHECKOUT_SUCCESS_URL", f"{FRONTEND_URL}/success"
+    "CHECKOUT_SUCCESS_URL", "https://ochelink-backend.onrender.com/docs"
 )
 CHECKOUT_CANCEL_URL = os.environ.get(
-    "CHECKOUT_CANCEL_URL", f"{FRONTEND_URL}/cancel"
+    "CHECKOUT_CANCEL_URL", "https://ochelink-backend.onrender.com/docs"
 )
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -48,22 +48,34 @@ app = FastAPI()
 # Email verification routes
 app.include_router(email_verification_router)
 
+# CORS (Website -> API)
+# NOTE: Browsers send an OPTIONS "preflight" request before POSTing JSON with credentials.
+# Using allow_origins=["*"] together with allow_credentials=True will cause the preflight to fail.
+frontend_url = os.getenv("FRONTEND_URL", "").strip().rstrip("/")
+allowed_origins = []
+if frontend_url:
+    allowed_origins.append(frontend_url)
+    # If you set FRONTEND_URL to https://ochelink.com, also allow www.
+    if frontend_url.startswith("https://") and frontend_url.count(".") >= 1:
+        host = frontend_url.split("https://", 1)[1]
+        if host.startswith("www."):
+            allowed_origins.append("https://" + host[len("www."):])
+        else:
+            allowed_origins.append("https://www." + host)
+
+# Fallback (safe defaults for production)
+for o in ["https://ochelink.com", "https://www.ochelink.com"]:
+    if o not in allowed_origins:
+        allowed_origins.append(o)
+
 app.add_middleware(
     CORSMiddleware,
-    # IMPORTANT:
-    # - Do NOT use allow_origins=["*"] with allow_credentials=True (browsers block this).
-    # - This API uses Bearer tokens, not cookies, so credentials are not required.
-    # - Restrict origins to your Cloudflare Pages/custom domain(s).
-    allow_origins=[
-        "https://ochelink.com",
-        "https://www.ochelink.com",
-        # Add preview domain if needed, e.g.:
-        # "https://your-project.pages.dev",
-    ],
-    allow_credentials=False,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # ==========================
 # DB
