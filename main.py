@@ -8,7 +8,6 @@ import time
 import psycopg2
 import stripe
 import logging
-from contextlib import contextmanager
 
 from email_verification import router as email_verification_router, send_verification_email
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -81,28 +80,8 @@ app.add_middleware(
 # ==========================
 # DB
 # ==========================
-@contextmanager
 def db():
-    """Open a short-lived DB connection and ALWAYS close it.
-
-    IMPORTANT: psycopg2's connection context manager commits/rolls back but does NOT
-    close the connection. If you open a new connection per request and don't close it,
-    Supabase's pooler will hit its max clients and logins will fail.
-
-    This wrapper keeps your existing `with db() as conn:` usage but guarantees closing.
-    """
-    conn = psycopg2.connect(
-        DATABASE_URL,
-        connect_timeout=10,
-        application_name="ochelink-backend",
-    )
-    try:
-        yield conn
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+    return psycopg2.connect(DATABASE_URL)
 
 # ==========================
 # AUTH HELPERS
@@ -481,14 +460,6 @@ def license_check(data: LicenseCheckIn, request: Request):
     if not fp:
         raise HTTPException(status_code=400, detail="device_fingerprint required")
 
-    # Website must NOT consume device slots. Only the desktop app should register devices.
-    client = (request.headers.get("x-ochelink-client") or request.headers.get("X-Ochelink-Client") or "").strip().lower()
-    is_app_client = client == "app"
-
-
-    # DEBUG (temporary): diagnose device registration from packaged builds
-    fp_short = fp[:12] if fp else ''
-    print(f\"[license/check] email={email} client='{client}' is_app={is_app_client} fp={fp_short}\", flush=True)
     with db() as conn:
         cur = conn.cursor()
 
@@ -526,30 +497,6 @@ def license_check(data: LicenseCheckIn, request: Request):
                 (license_id,),
             )
             return int(cur.fetchone()[0])
-
-        # If this call is coming from the website (or any non-app client),
-        # DO NOT register the device or enforce device limits.
-        if not is_app_client:
-            if not active:
-                used = count_active_devices()
-                conn.commit()
-                return {
-                    "allowed": False,
-                    "reason": "license_inactive",
-                    "devices_used": used,
-                    "device_limit": device_limit,
-                }
-
-            used = count_active_devices()
-            conn.commit()
-            return {
-                "allowed": True,
-                "reason": "web_check_no_device",
-                # DEBUG
-                "debug_client": client,
-                "devices_used": used,
-                "device_limit": device_limit,
-            }
 
         if not active:
             used = count_active_devices()
