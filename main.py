@@ -485,6 +485,10 @@ def license_check(data: LicenseCheckIn, request: Request):
     client = (request.headers.get("x-ochelink-client") or request.headers.get("X-Ochelink-Client") or "").strip().lower()
     is_app_client = client == "app"
 
+
+    # DEBUG (temporary): diagnose device registration from packaged builds
+    fp_short = fp[:12] if fp else ''
+    print(f\"[license/check] email={email} client='{client}' is_app={is_app_client} fp={fp_short}\", flush=True)
     with db() as conn:
         cur = conn.cursor()
 
@@ -541,6 +545,8 @@ def license_check(data: LicenseCheckIn, request: Request):
             return {
                 "allowed": True,
                 "reason": "web_check_no_device",
+                # DEBUG
+                "debug_client": client,
                 "devices_used": used,
                 "device_limit": device_limit,
             }
@@ -586,6 +592,7 @@ def license_check(data: LicenseCheckIn, request: Request):
             }
 
         # Under limit -> register new device (Option 1: reinstall counts as a new device)
+        print(f"[license/check] registering device fp={fp_short} license_id={license_id}", flush=True)
         cur.execute(
             """
             INSERT INTO public.devices (license_id, device_fingerprint, revoked)
@@ -595,6 +602,7 @@ def license_check(data: LicenseCheckIn, request: Request):
         )
 
         used_after = count_active_devices()
+        print(f"[license/check] registered fp={fp_short} used_after={used_after} limit={device_limit}", flush=True)
         conn.commit()
 
         return {
