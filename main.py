@@ -467,25 +467,23 @@ def license_check(data: LicenseCheckIn, request: Request):
     """
     Desktop app sends:
       - Authorization: Bearer <JWT from /auth/login>
+      - Header: X-Ochelink-Client: app
       - JSON: { "device_fingerprint": "..." }
 
-    Returns:
-      - allowed (bool)
-      - reason (string)
-      - devices_used (int)
-      - device_limit (int)
+    Website should NOT use this endpoint. If it does, devices will NOT be registered.
     """
     email = _email_from_bearer(request)
-    fp = (data.device_fingerprint or "").strip()
-    fp_short = fp[:12] if fp else ""
 
-    if not fp:
-        raise HTTPException(status_code=400, detail="device_fingerprint required")
+    # Only the desktop app is allowed to register/enforce devices
+    client = (request.headers.get("X-Ochelink-Client") or request.headers.get("x-ochelink-client") or "").strip().lower()
+    is_app_client = (client == "app")
+
+    fp = (data.device_fingerprint or "").strip()
 
     with db() as conn:
         cur = conn.cursor()
 
-        # Transaction (default) + FOR UPDATE prevents two concurrent logins
+        # Lock the license row to prevent concurrent device registration races
         cur.execute(
             """
             SELECT id, active, device_limit
@@ -508,7 +506,6 @@ def license_check(data: LicenseCheckIn, request: Request):
 
         license_id, active, device_limit = lic[0], bool(lic[1]), int(lic[2] or 0)
 
-        # Count active devices helper
         def count_active_devices() -> int:
             cur.execute(
                 """
@@ -519,6 +516,22 @@ def license_check(data: LicenseCheckIn, request: Request):
                 (license_id,),
             )
             return int(cur.fetchone()[0])
+
+        # If this isn't the app client, NEVER register a device and NEVER block on device limits.
+        # This prevents website sign-ins from consuming device slots.
+        if not is_app_client:
+            used = count_active_devices()
+            conn.commit()
+            return {
+                "allowed": bool(active),
+                "reason": "web_check_no_device",
+                "devices_used": used,
+                "device_limit": device_limit,
+            }
+
+        # App client requires a fingerprint
+        if not fp:
+            raise HTTPException(status_code=400, detail="device_fingerprint required")
 
         if not active:
             used = count_active_devices()
@@ -560,7 +573,7 @@ def license_check(data: LicenseCheckIn, request: Request):
                 "device_limit": device_limit,
             }
 
-        # Under limit -> register new device (Option 1: reinstall counts as a new device)
+        # Under limit -> register new device
         cur.execute(
             """
             INSERT INTO public.devices (license_id, device_fingerprint, revoked)
