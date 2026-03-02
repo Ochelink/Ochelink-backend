@@ -8,6 +8,7 @@ import time
 import psycopg2
 import stripe
 import logging
+from contextlib import contextmanager
 
 from email_verification import router as email_verification_router, send_verification_email
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
@@ -80,8 +81,28 @@ app.add_middleware(
 # ==========================
 # DB
 # ==========================
+@contextmanager
 def db():
-    return psycopg2.connect(DATABASE_URL)
+    """Open a short-lived DB connection and ALWAYS close it.
+
+    IMPORTANT: psycopg2's connection context manager commits/rolls back but does NOT
+    close the connection. If you open a new connection per request and don't close it,
+    Supabase's pooler will hit its max clients and logins will fail.
+
+    This wrapper keeps your existing `with db() as conn:` usage but guarantees closing.
+    """
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        application_name="ochelink-backend",
+    )
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ==========================
 # AUTH HELPERS
@@ -456,6 +477,7 @@ def license_check(data: LicenseCheckIn, request: Request):
     """
     email = _email_from_bearer(request)
     fp = (data.device_fingerprint or "").strip()
+    fp_short = fp[:12] if fp else ""
 
     if not fp:
         raise HTTPException(status_code=400, detail="device_fingerprint required")
@@ -539,7 +561,6 @@ def license_check(data: LicenseCheckIn, request: Request):
             }
 
         # Under limit -> register new device (Option 1: reinstall counts as a new device)
-        print(f"[license/check] registering device fp={fp_short} license_id={license_id}", flush=True)
         cur.execute(
             """
             INSERT INTO public.devices (license_id, device_fingerprint, revoked)
@@ -549,7 +570,6 @@ def license_check(data: LicenseCheckIn, request: Request):
         )
 
         used_after = count_active_devices()
-        print(f"[license/check] registered fp={fp_short} used_after={used_after} limit={device_limit}", flush=True)
         conn.commit()
 
         return {
