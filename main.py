@@ -381,6 +381,7 @@ def create_checkout_session(data: CheckoutIn):
         mode="payment",
         line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
         customer_email=email,
+        allow_promotion_codes=True,
         success_url=CHECKOUT_SUCCESS_URL,
         cancel_url=CHECKOUT_CANCEL_URL,
     )
